@@ -13,6 +13,7 @@ from typing import List, Optional, Tuple
 from loguru import logger
 
 from filters.cpv import score_cpv_codes
+from filters.department import department_filter
 from filters.keywords import NEGATIVE_KEYWORDS, POSITIVE_KEYWORDS
 
 
@@ -66,11 +67,20 @@ class HealthcareAIScorer:
             score += cpv_score
             matched.append(f"CPV codes: +{cpv_score}")
 
-        # ── Source bonus ──────────────────────────────────────────────────
+        # ── Source bonus ──────────────────────────────────────────────
         source = tender.get("source", "")
         if source in ("gba", "bmftr"):
             score += 10  # These sources are specifically healthcare/research
             matched.append(f"Source bonus ({source}): +10")
+
+        # ── Department topic filter ───────────────────────────────────
+        topic_score, topics = department_filter.classify(tender)
+        if topic_score != 0:
+            score += topic_score
+            if topics:
+                matched.append(f"Department topics ({', '.join(topics[:2])}): +{topic_score}")
+            else:
+                matched.append(f"Department: no topic match: {topic_score}")
 
         logger.debug(
             f"Scored [{tender.get('source', '?')}] "

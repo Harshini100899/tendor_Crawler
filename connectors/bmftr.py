@@ -1,9 +1,11 @@
 """
-HFIP – BMBF/BMFTR Connector
-Scrapes the German Federal Ministry of Education and Research (BMBF)
-and the Förderportal Bund for healthcare & AI funding programmes.
-Source: https://www.bmbf.de/bmbf/de/forschung/gesundheit/gesundheit.html
-        https://www.foerderportal.bund.de
+HFIP – BMFTR Connector
+Scrapes the Federal Ministry for Research, Technology and Space (BMFTR)
+Bekanntmachungsuche portal filtered to the Gesundheit theme.
+
+Target URL (exactly as specified):
+  https://www.bmftr.bund.de/SiteGlobals/Forms/Suche/Bekanntmachungsuche/
+  Bekanntmachungsuche_Formular.html?cl2Categories_Themen=gesundheit
 """
 
 from __future__ import annotations
@@ -22,16 +24,19 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 from database.models import Tender
 
 
-BMBF_BASE = "https://www.bmbf.de"
-BMBF_HEALTH_URL = f"{BMBF_BASE}/bmbf/de/forschung/gesundheit/gesundheit.html"
-BMBF_KI_URL = f"{BMBF_BASE}/bmbf/de/forschung/digitale-wirtschaft-und-gesellschaft/kuenstliche-intelligenz/kuenstliche-intelligenz.html"
-FOERDERPORTAL_BASE = "https://foerderportal.bund.de"
+# ─── URLs ─────────────────────────────────────────────────────────────────────
 
-SEARCH_KEYWORDS = [
-    "Gesundheit", "KI", "Künstliche Intelligenz", "Digital Health",
-    "Medizin", "Digitale Medizin", "eHealth", "Telemedizin",
-    "Krankenhaus", "Pflege", "Medizinische Informatik",
-]
+BMFTR_BASE = "https://www.bmftr.bund.de"
+BMFTR_SEARCH_URL = (
+    f"{BMFTR_BASE}/SiteGlobals/Forms/Suche/Bekanntmachungsuche/"
+    "Bekanntmachungsuche_Formular.html"
+)
+# Fixed query parameter as required
+BMFTR_SEARCH_PARAMS = {
+    "cl2Categories_Themen": "gesundheit",
+    "resultsPerPage": "20",
+    "pageNumber": "1",
+}
 
 DATE_PATTERNS = [r"(\d{2}\.\d{2}\.\d{4})", r"(\d{4}-\d{2}-\d{2})"]
 DEADLINE_MARKERS = ["frist", "einreichungsfrist", "deadline", "antragsfrist", "abgabefrist"]
@@ -39,129 +44,127 @@ DEADLINE_MARKERS = ["frist", "einreichungsfrist", "deadline", "antragsfrist", "a
 
 class BMFTRConnector:
     """
-    Scrapes BMBF health & AI funding pages and the Förderportal Bund.
-    Uses BeautifulSoup for static HTML and Playwright (optional) for JS pages.
+    Scrapes BMFTR Bekanntmachungen filtered to the 'Gesundheit' theme.
+    Paginates through all result pages.
     """
 
-    def __init__(self, delay: float = 3.0):
+    def __init__(self, delay: float = 2.0, max_pages: int = 5):
         self.delay = delay
+        self.max_pages = max_pages
         self.session = requests.Session()
         self.session.headers.update({
             "User-Agent": "HFIP/1.0 (Healthcare Funding Intelligence Platform)",
             "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         })
 
     def fetch_recent(self) -> List[dict]:
         tenders: List[dict] = []
-        tenders.extend(self._scrape_bmbf_health())
-        time.sleep(self.delay)
-        tenders.extend(self._scrape_bmbf_ki())
-        time.sleep(self.delay)
-        tenders.extend(self._scrape_foerderportal())
-        logger.info(f"BMFTR: collected {len(tenders)} funding opportunities")
+        for page_num in range(1, self.max_pages + 1):
+            page_tenders = self._fetch_page(page_num)
+            if not page_tenders:
+                break
+            tenders.extend(page_tenders)
+            logger.info(f"BMFTR page {page_num}: {len(page_tenders)} results")
+            time.sleep(self.delay)
+        logger.info(f"BMFTR: collected {len(tenders)} Bekanntmachungen total")
         return tenders
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=3, max=20))
-    def _get_soup(self, url: str) -> Optional[BeautifulSoup]:
+    def _fetch_page(self, page_num: int) -> List[dict]:
+        params = {**BMFTR_SEARCH_PARAMS, "pageNumber": str(page_num)}
         try:
-            resp = self.session.get(url, timeout=25)
+            resp = self.session.get(BMFTR_SEARCH_URL, params=params, timeout=25)
             resp.raise_for_status()
-            return BeautifulSoup(resp.text, "lxml")
+            soup = BeautifulSoup(resp.text, "lxml")
+            return self._parse_results(soup)
         except Exception as exc:
-            logger.warning(f"BMFTR scrape failed [{url}]: {exc}")
-            return None
-
-    def _scrape_bmbf_health(self) -> List[dict]:
-        soup = self._get_soup(BMBF_HEALTH_URL)
-        if not soup:
+            logger.warning(f"BMFTR page {page_num} failed: {exc}")
             return []
-        return self._extract_news_items(soup, BMBF_HEALTH_URL, "bmbf_health")
 
-    def _scrape_bmbf_ki(self) -> List[dict]:
-        soup = self._get_soup(BMBF_KI_URL)
-        if not soup:
-            return []
-        return self._extract_news_items(soup, BMBF_KI_URL, "bmbf_ki")
-
-    def _scrape_foerderportal(self) -> List[dict]:
-        """
-        Search the Förderportal Bund for health/AI funding programmes.
-        This portal lists all active federal funding programmes.
-        """
+    def _parse_results(self, soup: BeautifulSoup) -> List[dict]:
         tenders = []
-        for keyword in SEARCH_KEYWORDS[:3]:  # Limit to top keywords to avoid flooding
-            time.sleep(self.delay)
-            url = f"{FOERDERPORTAL_BASE}/foekat/jsp/SucheAction.do?action=searchlist&suchwort={keyword}&geberArt=B"
-            soup = self._get_soup(url)
-            if not soup:
-                continue
-            items = self._extract_foerderportal_items(soup, keyword)
-            tenders.extend(items)
-            logger.debug(f"Förderportal [{keyword}]: {len(items)} items")
+
+        # BMFTR uses a list of result items - try multiple CSS patterns
+        items = (
+            soup.find_all("div", class_=re.compile(r"(result|bekanntmachung|foerder|item|teaser|card)", re.I))
+            or soup.find_all("article")
+            or soup.find_all("li", class_=re.compile(r"(result|item|entry)", re.I))
+        )
+
+        # Deduplicate by href to avoid parsing the same link from wrapper+child divs
+        seen_urls: set = set()
+
+        for item in items:
+            tender = self._parse_item(item)
+            if tender and tender["url"] not in seen_urls:
+                seen_urls.add(tender["url"])
+                tenders.append(tender)
+
+        if not tenders:
+            logger.debug("BMFTR: no structured items found, trying link-based fallback")
+            tenders = self._fallback_links(soup)
+
         return tenders
 
-    def _extract_news_items(self, soup: BeautifulSoup, base_url: str, sub: str) -> List[dict]:
-        tenders = []
-        # BMBF uses article tags and .c-teaser classes
-        items = soup.find_all(["article", "div"], class_=re.compile(r"(teaser|news|meldung|aktuell|card)", re.I))
-        if not items:
-            items = soup.find_all("li", class_=re.compile(r"(teaser|news|item)", re.I))
+    def _parse_item(self, element) -> Optional[dict]:
+        try:
+            heading = element.find(re.compile(r"^h[1-6]$"))
+            title = heading.get_text(strip=True) if heading else ""
 
-        for item in items[:20]:
-            title_tag = item.find(re.compile(r"^h[1-6]$"))
-            if not title_tag:
-                title_tag = item.find("a")
-            if not title_tag:
-                continue
-            title = title_tag.get_text(strip=True)
+            if not title:
+                link_tag = element.find("a", href=True)
+                if link_tag:
+                    title = link_tag.get_text(strip=True)
             if len(title) < 10:
-                continue
+                return None
 
-            link_tag = item.find("a", href=True)
+            link_tag = element.find("a", href=True)
             href = link_tag["href"] if link_tag else ""
-            url = urljoin(base_url, href)
+            url = urljoin(BMFTR_BASE, href) if href else BMFTR_SEARCH_URL
 
-            desc_tag = item.find("p")
-            description = desc_tag.get_text(strip=True) if desc_tag else item.get_text(separator=" ", strip=True)[:1000]
+            desc_tag = element.find("p")
+            description = (
+                desc_tag.get_text(strip=True) if desc_tag
+                else element.get_text(separator=" ", strip=True)[:2000]
+            )
 
             deadline = self._extract_deadline(description)
 
-            tenders.append({
+            return {
                 "source": "bmftr",
                 "title": title,
                 "description": description[:3000],
-                "organization": "Bundesministerium für Bildung und Forschung (BMBF)",
+                "organization": "Bundesministerium für Forschung, Technologie und Raumfahrt (BMFTR)",
                 "country": "DE",
                 "deadline": deadline,
                 "published_date": datetime.utcnow(),
                 "url": url,
-                "cpv_codes": ["73000000", "72000000"],
+                "cpv_codes": ["73000000", "72000000", "85000000"],
                 "hash": Tender.compute_hash(title, url, "bmftr"),
-            })
-        return tenders
+            }
+        except Exception as exc:
+            logger.debug(f"BMFTR item parse error: {exc}")
+            return None
 
-    def _extract_foerderportal_items(self, soup: BeautifulSoup, keyword: str) -> List[dict]:
+    def _fallback_links(self, soup: BeautifulSoup) -> List[dict]:
+        """Fallback: collect every anchor that looks like a Bekanntmachung detail link."""
         tenders = []
-        rows = soup.find_all("tr")
-        for row in rows:
-            cells = row.find_all("td")
-            if len(cells) < 2:
+        seen: set = set()
+        for a in soup.find_all("a", href=re.compile(r"bekanntmachung|foerder", re.I)):
+            href = a.get("href", "")
+            url = urljoin(BMFTR_BASE, href)
+            title = a.get_text(strip=True)
+            if len(title) < 10 or url in seen:
                 continue
-            title = cells[0].get_text(strip=True)
-            if len(title) < 5:
-                continue
-            link_tag = cells[0].find("a", href=True)
-            href = link_tag["href"] if link_tag else ""
-            url = urljoin(FOERDERPORTAL_BASE, href)
-            desc = " ".join(c.get_text(strip=True) for c in cells[1:])[:2000]
-            deadline = self._extract_deadline(desc)
+            seen.add(url)
             tenders.append({
                 "source": "bmftr",
                 "title": title,
-                "description": desc,
-                "organization": "Förderportal Bund",
+                "description": title,
+                "organization": "BMFTR",
                 "country": "DE",
-                "deadline": deadline,
+                "deadline": None,
                 "published_date": datetime.utcnow(),
                 "url": url,
                 "cpv_codes": ["73000000"],

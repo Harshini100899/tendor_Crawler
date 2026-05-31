@@ -1,8 +1,10 @@
 """
 HFIP – G-BA Innovation Fund Connector
 Monitors the Gemeinsamer Bundesausschuss (G-BA) Innovationsfonds
-for current funding calls, including PDF extraction.
-Source: https://www.g-ba-innovationsfonds.de/foerderung/aktuelle-ausschreibungen/
+for current funding calls (Förderbekanntmachungen).
+
+Target URL (exactly as specified – static listing, no search):
+  https://innovationsfonds.g-ba.de/foerderbekanntmachungen/
 """
 
 from __future__ import annotations
@@ -22,9 +24,10 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 from database.models import Tender
 
 
-GBA_BASE = "https://www.g-ba-innovationsfonds.de"
-GBA_CALLS_URL = f"{GBA_BASE}/foerderung/aktuelle-ausschreibungen/"
-GBA_DGA_URL = "https://www.g-ba.de/themen/methodenbewertung/digitale-gesundheitsanwendungen/"
+# ─── URLs ─────────────────────────────────────────────────────────────────────
+# Exact URL as specified in requirements
+GBA_BASE = "https://innovationsfonds.g-ba.de"
+GBA_CALLS_URL = f"{GBA_BASE}/foerderbekanntmachungen/"
 
 DATE_PATTERNS = [
     r"(\d{2}\.\d{2}\.\d{4})",          # DD.MM.YYYY
@@ -54,7 +57,6 @@ class GBAConnector:
     def fetch_recent(self) -> List[dict]:
         tenders: List[dict] = []
         tenders.extend(self._scrape_innovation_calls())
-        tenders.extend(self._scrape_dga_calls())
         logger.info(f"G-BA: collected {len(tenders)} funding calls")
         return tenders
 
@@ -74,46 +76,42 @@ class GBAConnector:
             return []
 
         tenders = []
-        # G-BA uses article/card-based layout for funding calls
-        articles = soup.find_all(["article", "div"], class_=re.compile(r"(ausschreibung|foerderung|call|item|card)", re.I))
+        # innovationsfonds.g-ba.de uses article/card-based layout
+        articles = soup.find_all(["article", "div"], class_=re.compile(r"(bekanntmachung|foerder|call|item|card|teaser)", re.I))
         if not articles:
-            # Fallback: all anchor tags that look like call links
-            articles = soup.find_all("a", href=re.compile(r"/foerderung/"))
+            # Fallback: anchor tags that look like funding call links
+            articles = soup.find_all("a", href=re.compile(r"/foerderbekanntmachung", re.I))
 
+        seen_urls: set = set()
         for article in articles:
             tender = self._parse_article(article, GBA_CALLS_URL, "gba_innovationsfonds")
-            if tender:
+            if tender and tender["url"] not in seen_urls:
+                seen_urls.add(tender["url"])
                 tenders.append(tender)
-            time.sleep(self.delay)
+            time.sleep(self.delay * 0.1)  # small delay between items
 
-        return tenders
+        if not tenders:
+            logger.warning("G-BA: no items found with class selectors, trying link fallback")
+            for a in soup.find_all("a", href=re.compile(r"foerderbekanntmachung", re.I)):
+                href = a.get("href", "")
+                url = urljoin(GBA_BASE, href)
+                title = a.get_text(strip=True)
+                if len(title) < 10 or url in seen_urls:
+                    continue
+                seen_urls.add(url)
+                tenders.append({
+                    "source": "gba",
+                    "title": title,
+                    "description": title,
+                    "organization": "G-BA Innovationsfonds",
+                    "country": "DE",
+                    "deadline": None,
+                    "published_date": datetime.utcnow(),
+                    "url": url,
+                    "cpv_codes": ["85000000", "73000000"],
+                    "hash": Tender.compute_hash(title, url, "gba"),
+                })
 
-    def _scrape_dga_calls(self) -> List[dict]:
-        """Scrape G-BA DiGA (Digital Health Applications) page."""
-        soup = self._get_soup(GBA_DGA_URL)
-        if not soup:
-            return []
-
-        tenders = []
-        links = soup.find_all("a", href=re.compile(r"\.(pdf|html)$", re.I))
-        for link in links[:10]:  # Limit to avoid scraping the entire site
-            href = link.get("href", "")
-            full_url = urljoin(GBA_DGA_URL, href)
-            title = link.get_text(strip=True)
-            if len(title) < 10:
-                continue
-            tenders.append({
-                "source": "gba",
-                "title": title,
-                "description": f"G-BA DiGA funding call: {title}",
-                "organization": "Gemeinsamer Bundesausschuss (G-BA)",
-                "country": "DE",
-                "deadline": None,
-                "published_date": datetime.utcnow(),
-                "url": full_url,
-                "cpv_codes": ["85000000", "72000000"],
-                "hash": Tender.compute_hash(title, full_url, "gba"),
-            })
         return tenders
 
     def _parse_article(self, element, base_url: str, sub_source: str) -> Optional[dict]:
