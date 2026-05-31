@@ -52,29 +52,26 @@ TED_CPV_CODES = [
 
 # ── Notice types from expert search specification ─────────────────────────────
 TED_NOTICE_TYPES = [
-    "brin-eeig", "brin-ecs", "cn-standard", "cn-social", "can-modif",
-    "corr", "cn-desg", "can-desg", "pin-buyer", "qu-sy",
-    "pin-cfc-social", "pin-cfc-standard", "pin-only", "pin-rtl", "subco", "veat",
+    "cn-standard", "cn-social", "can-standard", "can-social",
+    "pin-buyer", "pin-only", "subco",
 ]
 
-# ── Full-text keyword groups from expert search specification ─────────────────
+# ── Full-text keyword groups (used only for undated queries) ──────────────────
 TED_FT_KEYWORDS = [
-    '"Gesundheit" OR "Health"',
-    '"KHZG" OR "medical"',
-    '"medizin" OR "patient"',
+    "Gesundheit OR Health",
+    "KHZG OR medical",
+    "medizin OR patient",
 ]
 
 # ── Build the expert search query string ─────────────────────────────────────
+# NOTE: TED v3 FT~ operator does not work combined with PD>= date filter.
+# We rely on CPV codes and notice types (specific enough for healthcare).
 _cpv_list = " ".join(TED_CPV_CODES)
-_ft_clause = " OR ".join(f'FT ~ ({kw})' for kw in TED_FT_KEYWORDS)
 _notice_types = " ".join(TED_NOTICE_TYPES)
 
 TED_EXPERT_QUERY = (
     f"classification-cpv IN ({_cpv_list}) "
-    f"AND ({_ft_clause}) "
-    f"AND contract-nature IN (services works) "
-    f"AND notice-type IN ({_notice_types}) "
-    f"AND NOT (classification-cpv IN (core mior dese))"
+    f"AND notice-type IN ({_notice_types})"
 )
 
 # Fields to request from TED API
@@ -89,7 +86,6 @@ TED_FIELDS = [
     "AU",   # Authority name
     "IA",   # Internet address (buyer's website)
     "TD",   # Document type
-    "publication-number",  # Canonical notice identifier for URL construction
 ]
 
 
@@ -138,7 +134,6 @@ class TEDConnector:
                 "limit": 25,
                 "scope": "ALL",
                 "onlyLatestVersions": True,
-                "sort": [{"field": "publication-number", "order": "DESC"}],
             }
 
             try:
@@ -229,11 +224,9 @@ class TEDConnector:
                 cpv_codes = []
 
             # URL – canonical TED notice page (primary link shown to users)
-            pub_number = notice.get("publication-number", "") or notice.get("ND", "")
-            notice_id  = notice.get("ND", "")
-            if pub_number:
-                url = f"https://ted.europa.eu/en/notice/{pub_number}/general-information"
-            elif notice_id:
+            # ND looks like "183476-2016"; URL: https://ted.europa.eu/en/notice/-/detail/183476-2016
+            notice_id = notice.get("ND", "")
+            if notice_id:
                 url = f"https://ted.europa.eu/en/notice/-/detail/{notice_id}"
             else:
                 url = ""

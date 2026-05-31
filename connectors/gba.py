@@ -76,42 +76,45 @@ class GBAConnector:
             return []
 
         tenders = []
-        # innovationsfonds.g-ba.de uses article/card-based layout
-        articles = soup.find_all(["article", "div"], class_=re.compile(r"(bekanntmachung|foerder|call|item|card|teaser)", re.I))
-        if not articles:
-            # Fallback: anchor tags that look like funding call links
-            articles = soup.find_all("a", href=re.compile(r"/foerderbekanntmachung", re.I))
-
         seen_urls: set = set()
-        for article in articles:
-            tender = self._parse_article(article, GBA_CALLS_URL, "gba_innovationsfonds")
-            if tender and tender["url"] not in seen_urls:
-                seen_urls.add(tender["url"])
-                tenders.append(tender)
-            time.sleep(self.delay * 0.1)  # small delay between items
 
-        if not tenders:
-            logger.warning("G-BA: no items found with class selectors, trying link fallback")
-            for a in soup.find_all("a", href=re.compile(r"foerderbekanntmachung", re.I)):
-                href = a.get("href", "")
-                url = urljoin(GBA_BASE, href)
-                title = a.get_text(strip=True)
-                if len(title) < 10 or url in seen_urls:
-                    continue
-                seen_urls.add(url)
-                tenders.append({
-                    "source": "gba",
-                    "title": title,
-                    "description": title,
-                    "organization": "G-BA Innovationsfonds",
-                    "country": "DE",
-                    "deadline": None,
-                    "published_date": datetime.utcnow(),
-                    "url": url,
-                    "cpv_codes": ["85000000", "73000000"],
-                    "hash": Tender.compute_hash(title, url, "gba"),
-                })
+        # Extract only individual funding-call pages.
+        # Individual calls match: /foerderbekanntmachungen/foerderbekanntmachung-<slug>
+        # Navigation pages to SKIP: /foerderbekanntmachungen/ (exact), /foerderbekanntmachungen/foerderverfahren/,
+        #   /foerderbekanntmachungen/termine-*
+        _call_re = re.compile(r"^/foerderbekanntmachungen/foerderbekanntmachung-.+", re.I)
 
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if not _call_re.match(href):
+                continue
+            full_url = urljoin(GBA_BASE, href)
+            if full_url in seen_urls:
+                continue
+            seen_urls.add(full_url)
+            title = a.get_text(strip=True)
+            if len(title) < 5:
+                # Try the parent element for a better title
+                parent = a.find_parent(["li", "article", "div", "td"])
+                if parent:
+                    title = parent.get_text(separator=" ", strip=True)[:200]
+            if len(title) < 5:
+                title = href.split("/")[-1].replace("-", " ").title()
+
+            tenders.append({
+                "source": "gba",
+                "title": title,
+                "description": title,
+                "organization": "Gemeinsamer Bundesausschuss (G-BA) Innovationsfonds",
+                "country": "DE",
+                "deadline": None,
+                "published_date": datetime.utcnow(),
+                "url": full_url,
+                "cpv_codes": ["85000000", "73000000"],
+                "hash": Tender.compute_hash(title, full_url, "gba"),
+            })
+
+        logger.info(f"G-BA: extracted {len(tenders)} unique funding call links")
         return tenders
 
     def _parse_article(self, element, base_url: str, sub_source: str) -> Optional[dict]:

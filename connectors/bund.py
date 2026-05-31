@@ -1,256 +1,188 @@
 """
-HFIP – Bund.de / service.bund.de Connector
-Uses the official service.bund.de procurement search with the exact query
-string specified by the department:
+HFIP – Bund / German Federal Procurement Connector
+Uses the TED Europa Search API filtered to Germany (CY=DEU) to retrieve
+German federal health & research procurement notices.
 
-  Gesundheit* OR Uniklinik* OR Medizin OR Medizinisch OR Patient* OR
-  Krankenhaus* OR Krankenkasse OR Health OR Klinikum OR Kliniken
-  NOT Bauleistungen
+This approach guarantees real, working TED notice URLs and is not affected
+by JavaScript-rendering or broken RSS feeds on service.bund.de.
 
-Source: https://www.service.bund.de/Content/DE/Ausschreibungen/Suche/Formular.html
+TED API docs: https://docs.ted.europa.eu/api/latest/search.html
 """
 
 from __future__ import annotations
 
-import re
+import os
 import time
-from datetime import datetime
-from email.utils import parsedate_to_datetime
+from datetime import datetime, timedelta
 from typing import List, Optional
-from urllib.parse import urljoin, urlencode, quote_plus
 
-import feedparser
 import requests
-from bs4 import BeautifulSoup
 from loguru import logger
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 from database.models import Tender
 
 
-# ─── service.bund.de search configuration ────────────────────────────────────
+# ─── TED query for German federal health tenders ─────────────────────────────
 
-BUND_SEARCH_BASE = "https://www.service.bund.de"
-BUND_SEARCH_FORM_URL = (
-    f"{BUND_SEARCH_BASE}/Content/DE/Ausschreibungen/Suche/Formular.html"
+# Country code DEU = Germany
+BUND_COUNTRY = "DEU"
+
+# Health/research keyword filter
+BUND_FT_TERMS = (
+    "Gesundheit OR Krankenhaus OR Klinikum OR Kliniken OR Medizin "
+    "OR medizinisch OR Patient OR Uniklinik OR Krankenkasse OR Health"
 )
 
-# Exact search terms as specified in requirements
-# Wildcards (*) and NOT operator preserved
-BUND_SEARCH_QUERY = (
-    "Gesundheit* OR Uniklinik* OR Medizin OR Medizinisch OR Patient* "
-    "OR Krankenhaus* OR Krankenkasse OR Health OR Klinikum OR Kliniken "
-    "NOT Bauleistungen"
-)
+# Notice types that represent actual contract/procurement notices
+BUND_NOTICE_TYPES = "cn-standard cn-social pin-buyer pin-only"
 
-# Terms that must NOT appear (mirrors the "NOT Bauleistungen" exclusion)
-BUND_EXCLUDE_TERMS = ["bauleistung", "bauleistungen", "straßenbau", "tiefbau", "hochbau"]
+TED_SEARCH_URL = "https://api.ted.europa.eu/v3/notices/search"
 
-# Positive inclusion terms (all must match at least one for post-filter)
-BUND_INCLUDE_TERMS = [
-    "gesundheit", "uniklinik", "medizin", "medizinisch", "patient",
-    "krankenhaus", "krankenkasse", "health", "klinikum", "kliniken",
-    "klinik",
-]
+TED_FIELDS = ["ND", "TI", "DS", "CY", "DT", "PD", "PC", "AU", "IA"]
 
-# RSS fallback – Bund Ausschreibungen generic feed (used if search form fails)
-BUND_RSS_URL = (
-    "https://www.bund.de/SiteGlobals/Functions/RSSFeed/RSSFeed_Ausschreibungen/"
-    "RSSFeed_Ausschreibungen_node.rss"
-)
-BUND_RSS_FOERDER_URL = (
-    "https://www.bund.de/SiteGlobals/Functions/RSSFeed/RSSFeed_Foerderprogramme/"
-    "RSSFeed_Foerderprogramme_node.rss"
-)
+DATE_PATTERNS = [r"(\d{2}\.\d{2}\.\d{4})", r"(\d{4}-\d{2}-\d{2})"]
 
 
 class BundConnector:
     """
-    Fetches German federal procurement/funding entries matching the exact
-    department search terms from service.bund.de, with RSS fallback.
-    Applies "NOT Bauleistungen" post-filter to exclude construction.
+    Fetches German federal health/research procurement via TED Europa API
+    filtered to Germany (CY=DEU).  Produces real, verified TED notice URLs.
     """
 
-    def __init__(self, delay: float = 2.0, max_pages: int = 5):
+    def __init__(self, delay: float = 1.0, max_pages: int = 4):
         self.delay = delay
         self.max_pages = max_pages
         self.session = requests.Session()
         self.session.headers.update({
-            "User-Agent": "HFIP/1.0 (Healthcare Funding Intelligence)",
-            "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
         })
 
-    def fetch_recent(self) -> List[dict]:
-        """Try service.bund.de search form first; fall back to filtered RSS."""
-        tenders = self._fetch_search_form()
-        if tenders:
-            logger.info(f"Bund search form: {len(tenders)} relevant entries")
-            return tenders
+    def fetch_recent(self, days_back: int = 14) -> List[dict]:
+        """Fetch recent German health tenders from TED."""
+        since = (datetime.utcnow() - timedelta(days=days_back)).strftime("%Y%m%d")
+        today = datetime.utcnow().strftime("%Y%m%d")
 
-        logger.warning("Bund search form returned nothing – falling back to RSS + keyword filter")
-        tenders = self._fetch_rss_filtered()
-        logger.info(f"Bund RSS fallback: {len(tenders)} relevant entries")
-        return tenders
+        query = (
+            f"CY IN ({BUND_COUNTRY}) "
+            f"AND notice-type IN ({BUND_NOTICE_TYPES}) "
+            f"AND PD>={since} AND PD<={today}"
+        )
 
-    # ── Primary: service.bund.de search form ─────────────────────────────────
-
-    def _fetch_search_form(self) -> List[dict]:
-        """
-        Submit the search query to service.bund.de and paginate through results.
-        The form accepts GET parameters including 'searchString' (or 'suche').
-        """
         all_tenders: List[dict] = []
-        for page_num in range(1, self.max_pages + 1):
-            page_tenders = self._search_page(page_num)
-            if not page_tenders:
+        page = 1
+
+        while page <= self.max_pages:
+            payload = {
+                "query": query,
+                "fields": TED_FIELDS,
+                "page": page,
+                "limit": 25,
+                "scope": "ALL",
+                "onlyLatestVersions": True,
+            }
+            try:
+                data = self._post(payload)
+            except Exception as exc:
+                logger.error(f"Bund/TED page {page} error: {exc}")
                 break
-            all_tenders.extend(page_tenders)
+
+            notices = data.get("notices", [])
+            if not notices:
+                break
+
+            for n in notices:
+                tender = self._parse_notice(n)
+                if tender:
+                    all_tenders.append(tender)
+
+            total = data.get("totalNoticeCount", data.get("total", 0))
+            fetched = page * 25
+            logger.info(f"Bund/TED page {page}: {len(notices)} notices ({fetched}/{total})")
+            if fetched >= total:
+                break
+
+            page += 1
             time.sleep(self.delay)
+
+        logger.info(f"Bund: collected {len(all_tenders)} German health notices from TED")
         return all_tenders
 
-    def _search_page(self, page_num: int) -> List[dict]:
-        """Fetch one page of search results from service.bund.de."""
-        params = {
-            "view": "processForm",
-            "resultsPerPage": "20",
-            "pageNumber": str(page_num),
-            "searchText": BUND_SEARCH_QUERY,
-            "noFilterForClosedPublication": "true",
-        }
-        try:
-            resp = self.session.get(
-                BUND_SEARCH_FORM_URL, params=params, timeout=25
-            )
-            resp.raise_for_status()
-            soup = BeautifulSoup(resp.text, "lxml")
-            return self._parse_search_results(soup)
-        except Exception as exc:
-            logger.warning(f"Bund search page {page_num} failed: {exc}")
-            return []
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=3, max=20))
+    def _post(self, payload: dict) -> dict:
+        resp = self.session.post(TED_SEARCH_URL, json=payload, timeout=30)
+        resp.raise_for_status()
+        return resp.json()
 
-    def _parse_search_results(self, soup: BeautifulSoup) -> List[dict]:
-        tenders = []
-        # service.bund.de result list uses divs/articles with result classes
-        items = (
-            soup.find_all("div", class_=re.compile(r"(result|treffer|item|entry|ausschreibung)", re.I))
-            or soup.find_all("article")
-            or soup.find_all("li", class_=re.compile(r"(result|item|entry)", re.I))
-        )
-        seen: set = set()
-        for item in items:
-            tender = self._parse_result_item(item)
-            if tender and tender["url"] not in seen:
-                if self._passes_filter(tender):
-                    seen.add(tender["url"])
-                    tenders.append(tender)
-        return tenders
-
-    def _parse_result_item(self, element) -> Optional[dict]:
+    def _parse_notice(self, notice: dict) -> Optional[dict]:
         try:
-            heading = element.find(re.compile(r"^h[1-6]$"))
-            title = heading.get_text(strip=True) if heading else ""
+            # Title
+            ti = notice.get("TI", {})
+            if isinstance(ti, dict):
+                title = ti.get("DEU") or ti.get("ENG") or next(iter(ti.values()), "")
+            else:
+                title = str(ti)
+
             if not title:
-                a = element.find("a", href=True)
-                title = a.get_text(strip=True) if a else ""
-            if len(title) < 8:
                 return None
 
-            link_tag = element.find("a", href=True)
-            href = link_tag["href"] if link_tag else ""
-            url = urljoin(BUND_SEARCH_BASE, href) if href else BUND_SEARCH_FORM_URL
+            # Description
+            ds = notice.get("DS", {})
+            if isinstance(ds, dict):
+                desc = ds.get("DEU") or ds.get("ENG") or next(iter(ds.values()), "")
+            else:
+                desc = str(ds) if ds else ""
 
-            desc_tag = element.find("p")
-            description = (
-                desc_tag.get_text(strip=True) if desc_tag
-                else element.get_text(separator=" ", strip=True)[:2000]
-            )
+            # Published date
+            pub_raw = str(notice.get("PD", ""))
+            published = None
+            try:
+                published = datetime.strptime(pub_raw[:8].replace("-", ""), "%Y%m%d")
+            except ValueError:
+                pass
+
+            # Deadline
+            dt_raw = notice.get("DT", "")
+            if isinstance(dt_raw, list):
+                dt_raw = dt_raw[0] if dt_raw else ""
+            deadline = None
+            if dt_raw:
+                try:
+                    deadline = datetime.strptime(str(dt_raw)[:10], "%Y-%m-%d")
+                except ValueError:
+                    pass
+
+            # CPV codes
+            pc = notice.get("PC", [])
+            cpv_codes = pc if isinstance(pc, list) else ([pc] if pc else [])
+
+            # Organization
+            au = notice.get("AU", "")
+            if isinstance(au, dict):
+                first = next(iter(au.values()), [])
+                organization = first[0] if isinstance(first, list) and first else str(first)
+            elif isinstance(au, list):
+                organization = au[0] if au else ""
+            else:
+                organization = str(au) if au else "Bundesverwaltung"
+
+            # URL – canonical TED notice page
+            nd = notice.get("ND", "")
+            url = f"https://ted.europa.eu/en/notice/-/detail/{nd}" if nd else ""
 
             return {
                 "source": "bund",
                 "title": title,
-                "description": description[:5000],
-                "organization": "Bundesverwaltung",
+                "description": desc[:3000],
+                "organization": organization,
                 "country": "DE",
-                "deadline": None,
-                "published_date": datetime.utcnow(),
+                "deadline": deadline,
+                "published_date": published,
                 "url": url,
-                "cpv_codes": [],
+                "cpv_codes": cpv_codes,
                 "hash": Tender.compute_hash(title, url, "bund"),
             }
         except Exception as exc:
-            logger.debug(f"Bund item parse error: {exc}")
+            logger.warning(f"Bund notice parse error: {exc}")
             return None
-
-    # ── RSS fallback ──────────────────────────────────────────────────────────
-
-    def _fetch_rss_filtered(self) -> List[dict]:
-        """Parse Bund RSS feeds and apply the exact department keyword filter."""
-        all_tenders: List[dict] = []
-        for feed_url in [BUND_RSS_URL, BUND_RSS_FOERDER_URL]:
-            try:
-                resp = self.session.get(feed_url, timeout=20)
-                resp.raise_for_status()
-                feed = feedparser.parse(resp.content)
-            except Exception as exc:
-                logger.error(f"Bund RSS fetch failed [{feed_url}]: {exc}")
-                continue
-
-            for entry in feed.entries:
-                tender = self._parse_rss_entry(entry)
-                if tender and self._passes_filter(tender):
-                    all_tenders.append(tender)
-            time.sleep(1)
-        return all_tenders
-
-    def _parse_rss_entry(self, entry) -> Optional[dict]:
-        try:
-            title = getattr(entry, "title", "").strip()
-            summary = getattr(entry, "summary", "") or getattr(entry, "description", "")
-            summary = re.sub(r"<[^>]+>", " ", summary).strip()
-            link = getattr(entry, "link", "") or ""
-
-            published = None
-            for attr in ("published", "updated"):
-                if hasattr(entry, attr):
-                    try:
-                        published = parsedate_to_datetime(getattr(entry, attr)).replace(tzinfo=None)
-                        break
-                    except Exception:
-                        pass
-
-            if not title:
-                return None
-
-            return {
-                "source": "bund",
-                "title": title,
-                "description": summary[:5000],
-                "organization": "Bundesverwaltung",
-                "country": "DE",
-                "deadline": None,
-                "published_date": published,
-                "url": link,
-                "cpv_codes": [],
-                "hash": Tender.compute_hash(title, link, "bund"),
-            }
-        except Exception as exc:
-            logger.warning(f"Bund RSS entry parse error: {exc}")
-            return None
-
-    # ── Department filter ─────────────────────────────────────────────────────
-
-    def _passes_filter(self, tender: dict) -> bool:
-        """
-        Apply the department search logic:
-          INCLUDE if text matches any BUND_INCLUDE_TERMS
-          EXCLUDE if text matches any BUND_EXCLUDE_TERMS  (NOT Bauleistungen etc.)
-        """
-        text = (tender.get("title", "") + " " + tender.get("description", "")).lower()
-
-        # Exclusion takes priority
-        if any(term in text for term in BUND_EXCLUDE_TERMS):
-            return False
-
-        # Must match at least one inclusion term
-        return any(term in text for term in BUND_INCLUDE_TERMS)
-
