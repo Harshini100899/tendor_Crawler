@@ -1,0 +1,104 @@
+# ─────────────────────────────────────────────
+# Healthcare Funding Intelligence Platform (HFIP)
+# Central Configuration
+# ─────────────────────────────────────────────
+
+app:
+  name: "Healthcare Funding Intelligence Platform"
+  version: "1.0.0"
+  log_level: "INFO"
+
+database:
+  path: "data/hfip.db"
+  echo: false
+
+# ─── TED Europa ───────────────────────────────
+ted:
+  base_url: "https://api.ted.europa.eu/v3"
+  search_endpoint: "/notices/search"
+  page_size: 50
+  # CPV codes relevant to Healthcare AI
+  cpv_codes:
+    - "72000000"   # IT services
+    - "72200000"   # Software programming / consultancy
+    - "72300000"   # Data services
+    - "85000000"   # Health and social work services
+    - "85100000"   # Health services
+    - "85110000"   # Hospital services
+    - "73000000"   # R&D services
+    - "73100000"   # R&D services
+    - "48000000"   # Software packages
+    - "72212000"   # Programming of application software
+
+# ─── Bund.de RSS ──────────────────────────────
+bund:
+  rss_feeds:
+    - url: "https://www.bund.de/SiteGlobals/Functions/RSSFeed/RSSFeed_Ausschreibungen/RSSFeed_Ausschreibungen_node.rss"
+      name: "Bund Ausschreibungen"
+    - url: "https://www.bund.de/SiteGlobals/Functions/RSSFeed/RSSFeed_Foerderprogramme/RSSFeed_Foerderprogramme_node.rss"
+      name: "Bund Foerderprogramme"
+
+# ─── G-BA (Gemeinsamer Bundesausschuss) ───────
+gba:
+  base_url: "https://www.g-ba.de"
+  funding_url: "https://www.g-ba.de/themen/methodenbewertung/digitale-gesundheitsanwendungen/"
+  innovation_url: "https://www.g-ba-innovationsfonds.de/foerderung/aktuelle-ausschreibungen/"
+  request_delay_seconds: 2
+
+# ─── BMFTR ────────────────────────────────────
+bmftr:
+  base_url: "https://www.bmbf.de"
+  search_url: "https://www.foerderportal.bund.de/foekat/jsp/StartAction.do"
+  categories:
+    - "Gesundheit"
+    - "KI"
+    - "Digital Health"
+    - "Medizin"
+    - "Forschung"
+  request_delay_seconds: 3
+
+# ─── Scheduler ────────────────────────────────
+scheduler:
+  ted_cron: "0 6 * * *"        # Daily at 06:00
+  bund_cron: "0 7 * * *"       # Daily at 07:00
+  gba_cron: "0 8 * * 1"        # Weekly Monday at 08:00
+  bmftr_cron: "0 9 * * 1"      # Weekly Monday at 09:00
+  evaluation_cron: "0 10 * * *" # Daily at 10:00
+  timezone: "Europe/Berlin"
+
+# ─── Scoring Thresholds ───────────────────────
+scoring:
+  min_score_for_ai: 50
+  min_score_for_alert: 80
+  tavily_enrichment_min_score: 50
+
+# ─── Groq LLM ─────────────────────────────────
+groq:
+  model: "llama3-70b-8192"
+  temperature: 0.1
+  max_tokens: 1024
+  base_url: "https://api.groq.com/openai/v1"
+
+# ─── Tavily ───────────────────────────────────
+tavily:
+  max_results: 5
+  search_depth: "advanced"
+  include_answer: true
+
+# ─── Notifications ────────────────────────────
+notifications:
+  teams:
+    enabled: true
+    # webhook_url loaded from environment variable: TEAMS_WEBHOOK_URL
+  email:
+    enabled: false
+    smtp_host: "smtp.gmail.com"
+    smtp_port: 587
+    # credentials loaded from environment variables:
+    # EMAIL_SENDER, EMAIL_PASSWORD, EMAIL_RECIPIENTS
+
+# ─── Dashboard ────────────────────────────────
+dashboard:
+  host: "0.0.0.0"
+  port: 8501
+  page_title: "HFIP - Healthcare Funding Intelligence"
